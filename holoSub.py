@@ -37,7 +37,7 @@ FONT_MONO = ("Consolas", 9)
 # ── constants ────────────────────────────────────────────────────────────────
 GEMINI_MODEL        = "gemini-3-flash-preview"
 CHUNK_SECS          = 3 * 60    # ~3 min — smaller chunks improve timestamp accuracy
-MAX_WORKERS         = 2         # parallel Gemini subtitle calls (respects free-tier RPM)
+MAX_WORKERS         = 1         # single Gemini worker — prevents cascading rate limit failures
 UPLOAD_WORKERS      = 4         # parallel Files API uploads (independent of RPM)
 REENCODE_HEIGHT     = 360
 REENCODE_FPS        = 1
@@ -198,6 +198,21 @@ def download_source(url, out_dir, log):
     """Download H.264 ≤480p + best audio. Returns (path, title)."""
     import yt_dlp
     log("📥  Downloading video…")
+
+    last_pct = [-1]
+    _ansi = re.compile(r'\x1b\[[0-9;]*m')
+    def progress_hook(d):
+        if d.get("status") == "downloading":
+            downloaded = d.get("downloaded_bytes", 0)
+            total      = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+            speed      = _ansi.sub("", d.get("_speed_str", "")).strip()
+            eta        = _ansi.sub("", d.get("_eta_str", "")).strip()
+            if total and total > 0:
+                pct = int(downloaded / total * 100)
+                if pct // 5 > last_pct[0]:
+                    last_pct[0] = pct // 5
+                    log(f"   {pct}%  {speed}  ETA {eta}")
+
     ydl_opts = {
         "format": (
             "bestvideo[height<=480][vcodec^=avc]+bestaudio[ext=m4a]"
@@ -208,6 +223,7 @@ def download_source(url, out_dir, log):
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
+        "progress_hooks": [progress_hook],
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info  = ydl.extract_info(url, download=True)
@@ -383,7 +399,9 @@ def validate_api_key(api_key, model=GEMINI_MODEL):
             return False, "Invalid API key — check it and try again."
         if "404" in err or "not found" in err.lower():
             return False, f"Model not available on your account: {model}"
-        return False, f"Could not reach Gemini API: {err[:120]}"
+        if "429" in err or "quota" in err.lower() or "exhausted" in err.lower():
+            return False, f"API quota exhausted — try again later or switch to a different model.\n\nFull error: {err}"
+        return False, f"Could not reach Gemini API: {err}"
 
 # ── prompt ────────────────────────────────────────────────────────────────────
 
@@ -617,7 +635,11 @@ def parse_response(raw_text, offset_ms, label, log):
 
     analysis = obj.get("global_analysis", "")
     if analysis:
-        log(f"💬  {label}: {analysis[:150]}")
+        if len(analysis) > 150:
+            truncated_analysis = analysis[:150].rsplit(' ', 1)[0] + "…"
+        else:
+            truncated_analysis = analysis
+        log(f"💬  {label}: {truncated_analysis}")
 
     if truncated:
         log(f"⚠️  {label}: response was truncated, salvaged {len(obj.get('subs', []))} entries — will retry")
@@ -640,7 +662,8 @@ def parse_response(raw_text, offset_ms, label, log):
 # ── chunk worker ──────────────────────────────────────────────────────────────
 
 def process_chunk(i, chunk_path, offset_ms, chunk_duration_ms, instruction, resume_path,
-                  api_key, uploader, model, label, log_fn):
+                  api_key, uploader, model, label, log_fn,
+                  rate_limit_until=None, rate_limit_lock=None):
     """Upload → Gemini → parse → cache. Returns (i, entries)."""
     from google import genai
     from google.genai import types
@@ -695,6 +718,15 @@ def process_chunk(i, chunk_path, offset_ms, chunk_duration_ms, instruction, resu
     )
 
     for attempt in range(5):
+        # Respect global rate limit pause set by any worker
+        if rate_limit_until is not None and rate_limit_lock is not None:
+            with rate_limit_lock:
+                wait_until = rate_limit_until[0]
+            now = time.time()
+            if wait_until > now:
+                sleep_secs = wait_until - now
+                log_fn(f"⏸️  {label}: waiting {sleep_secs:.0f}s for global rate limit cooldown…")
+                time.sleep(sleep_secs)
         prompt = (strict_prefix + instruction) if attempt > 0 else instruction
         try:
             response = client.models.generate_content(
@@ -778,7 +810,12 @@ def process_chunk(i, chunk_path, offset_ms, chunk_duration_ms, instruction, resu
                 wait   = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
                 reason = "Rate limited" if is_rate else ("Timeout" if is_timeout else "Server unavailable")
                 log_fn(f"⏳  {reason} on {label} — waiting {wait}s ({attempt+1}/5)…")
-                time.sleep(wait)
+                # Set global rate limit pause so other workers also back off
+                if is_rate and rate_limit_until is not None and rate_limit_lock is not None:
+                    with rate_limit_lock:
+                        rate_limit_until[0] = max(rate_limit_until[0], time.time() + wait)
+                else:
+                    time.sleep(wait)
                 if attempt == 4:
                     log_fn(f"❌  {label}: retries exhausted")
                     return i, []
@@ -798,6 +835,10 @@ def transcribe_with_gemini(source_path, task, api_key, title,
     # All FFmpeg work in ASCII tmp_dir — avoids Windows Unicode path issues
     split_dir = os.path.join(tmp_dir, "splits")
     os.makedirs(split_dir, exist_ok=True)
+
+    # Global rate limit pause — when any worker hits a 429, all workers wait
+    _rate_limit_until = [0.0]
+    _rate_limit_lock  = threading.Lock()
 
     mb = os.path.getsize(source_path) / 1_048_576
     log(f"🎙️  Source: {mb:.1f} MB")
@@ -851,7 +892,8 @@ def transcribe_with_gemini(source_path, task, api_key, title,
         chunk_dur_ms = int(get_duration(chunk_path) * 1000) if get_duration(chunk_path) else CHUNK_SECS * 1000
         idx, entries = process_chunk(
             i, chunk_path, offset_ms, chunk_dur_ms, instruction,
-            resume_path, api_key, uploader, model, label, log
+            resume_path, api_key, uploader, model, label, log,
+            _rate_limit_until, _rate_limit_lock
         )
         with lock:
             completed[0] += 1
@@ -893,9 +935,313 @@ def sanitise_folder_name(title):
         title = title[:60].rsplit(' ', 1)[0].strip()
     return title or "video"
 
-# ── top-level pipeline ────────────────────────────────────────────────────────
+# ── local pipeline (Whisper + Gemini translation) ────────────────────────────
 
-def run_pipeline(source, is_url, task, api_key, outdir, skip_mins, model,
+def extract_audio(source_path, out_path, skip_secs, log):
+    """Extract audio from video as 16kHz mono WAV for Whisper."""
+    import subprocess
+    cmd = ["ffmpeg", "-y", "-loglevel", "error",
+           "-ss", str(skip_secs), "-i", str(source_path),
+           "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", out_path]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+        log(f"🎵  Audio extracted")
+        return True
+    except subprocess.CalledProcessError as e:
+        log(f"❌  Audio extraction failed: {e.stderr.decode('utf-8','replace')[-200:]}")
+        return False
+
+def transcribe_with_whisper(audio_path, resume_dir, skip_secs, log, progress_cb):
+    """Run faster-whisper in a subprocess. Returns list of {start_ms, end_ms, text}."""
+    import json as _json
+    import subprocess
+    import sys
+
+    whisper_cache = os.path.join(resume_dir, "whisper_transcript.json")
+    if os.path.exists(whisper_cache):
+        try:
+            with open(whisper_cache, "r", encoding="utf-8") as f:
+                segments = _json.load(f)
+            log(f"⏭️  Whisper: loaded from cache ({len(segments)} segments)")
+            return segments
+        except Exception:
+            pass
+
+    # Write a small helper script that runs Whisper and writes output to JSON
+    # Running in a subprocess isolates CUDA cleanup from the GUI process
+    helper_script = f"""
+import sys, json
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    print(json.dumps({{"error": "faster-whisper not installed"}}))
+    sys.exit(1)
+
+audio_path   = {repr(audio_path)}
+output_path  = {repr(whisper_cache)}
+skip_secs    = {skip_secs}
+
+try:
+    model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+except Exception:
+    try:
+        model = WhisperModel("large-v3", device="cpu", compute_type="int8")
+    except Exception as e:
+        print(json.dumps({{"error": str(e)}}))
+        sys.exit(1)
+
+segs, info = model.transcribe(
+    audio_path,
+    language="ja",
+    beam_size=5,
+    word_timestamps=True,
+    vad_filter=True,
+    vad_parameters={{"min_silence_duration_ms": 500}},
+)
+
+segments = []
+total_duration = info.duration if hasattr(info, "duration") else 0
+for seg in segs:
+    start_ms = int((seg.start + skip_secs) * 1000)
+    end_ms   = int((seg.end   + skip_secs) * 1000)
+    text     = seg.text.strip()
+    if text:
+        segments.append({{"start_ms": start_ms, "end_ms": end_ms, "text": text}})
+    if total_duration > 0:
+        pct = min(100, int(seg.end / total_duration * 100))
+        elapsed_mins = int(seg.end / 60)
+        total_mins   = int(total_duration / 60)
+        if elapsed_mins % 5 == 0:
+            print(f"PROGRESS {{elapsed_mins}} {{total_mins}} {{pct}}", flush=True)
+
+with open(output_path, "w", encoding="utf-8") as f:
+    json.dump(segments, f, ensure_ascii=False)
+print(f"DONE {{len(segments)}}", flush=True)
+"""
+
+    helper_path = os.path.join(resume_dir, "_whisper_runner.py")
+    os.makedirs(resume_dir, exist_ok=True)
+    with open(helper_path, "w", encoding="utf-8") as f:
+        f.write(helper_script)
+
+    log("🎙️  Loading Whisper large-v3 on CUDA…")
+
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, helper_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        last_logged = [-1]
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("PROGRESS"):
+                parts = line.split()
+                if len(parts) == 4:
+                    elapsed_mins, total_mins, pct = int(parts[1]), int(parts[2]), int(parts[3])
+                    progress_cb(int(elapsed_mins * 60), int(total_mins * 60))
+                    if elapsed_mins > last_logged[0]:
+                        last_logged[0] = elapsed_mins
+                        log(f"🎤  Transcribing… {elapsed_mins}/{total_mins} min ({pct}%)")
+            elif line.startswith("DONE"):
+                count = line.split()[1] if len(line.split()) > 1 else "?"
+                log(f"✅  Whisper: {count} segments transcribed")
+
+        proc.wait()
+
+        # Check if output was written successfully — return code isn't reliable
+        # since faster-whisper can exit non-zero due to CUDA cleanup warnings
+        if not os.path.exists(whisper_cache):
+            stderr = proc.stderr.read()
+            log(f"❌  Whisper failed: {stderr[-300:]}")
+            return []
+
+    except Exception as e:
+        log(f"❌  Whisper subprocess error: {e}")
+        return []
+    finally:
+        try:
+            os.remove(helper_path)
+        except Exception:
+            pass
+
+    # Load results from cache written by subprocess
+    try:
+        with open(whisper_cache, "r", encoding="utf-8") as f:
+            segments = _json.load(f)
+        return segments
+    except Exception as e:
+        log(f"❌  Could not read Whisper output: {e}")
+        return []
+
+def translate_with_gemini(segments, title, api_key, model, resume_dir, log, progress_cb):
+    """Batch-translate Japanese segments using Gemini text-only API."""
+    import json as _json
+    from google import genai
+    from google.genai import types
+
+    if not segments:
+        return []
+
+    trans_cache = os.path.join(resume_dir, "translation.json")
+    if os.path.exists(trans_cache):
+        try:
+            with open(trans_cache, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            if data.get("prompt_version") == PROMPT_VERSION:
+                saved = data.get("entries", [])
+                log(f"⏭️  Translation: loaded from cache ({len(saved)} entries)")
+                return saved
+        except Exception:
+            pass
+
+    client = genai.Client(api_key=api_key)
+    ctx    = f"Video title: {title}." if title else ""
+
+    # Build a translation-only prompt — no video, just text
+    system_prompt = f"""You are an expert translator for hololive VTuber streams.
+{ctx}
+
+### HOLOLIVE TALENT NAME REFERENCE
+These are the EXACT correct romanisations — never mis-romanise these names:
+- hololive JP Gen 0: Tokino Sora, Robocosan, AZKi, Sakura Miko, Hoshimachi Suisei
+- hololive JP Gen 1: Yozora Mel, Aki Rosenthal, Akai Haato, Shirakami Fubuki, Natsuiro Matsuri
+- hololive JP Gen 2: Minato Aqua, Murasaki Shion, Nakiri Ayame, Yuzuki Choco, Oozora Subaru
+- hololive JP GAMERS: Shirakami Fubuki, Ookami Mio, Nekomata Okayu, Inugami Korone
+- hololive JP Gen 3: Usada Pekora, Shiranui Flare, Shirogane Noel, Houshou Marine, Uruha Rushia
+- hololive JP Gen 4: Tsunomaki Watame, Tokoyami Towa, Himemori Luna, Amane Kanata, Kiryu Coco
+- hololive JP Gen 5: Yukihana Lamy, Momosuzu Nene, Shishiro Botan, Omaru Polka, Mano Aloe
+- hololive JP holoX: La+ Darknesss, Takane Lui, Hakui Koyori, Sakamata Chloe, Kazama Iroha
+- hololive JP holoAN: Izuki Michiru, Hanazono Sayaka, Kazeshiro Yuki
+- hololive ID Gen 1: Ayunda Risu, Moona Hoshinova, Airani Iofifteen
+- hololive ID Gen 2: Kureiji Ollie, Anya Melfissa, Pavolia Reine
+- hololive ID Gen 3: Vestia Zeta, Kaela Kovalskia, Kobo Kanaeru
+- hololive EN Myth: Mori Calliope, Takanashi Kiara, Ninomae Ina'nis, Watson Amelia, Gawr Gura
+- hololive EN Promise: IRyS, Ceres Fauna, Ouro Kronii, Hakos Baelz, Tsukumo Sana, Nanashi Mumei
+- hololive EN Advent: Shiori Novella, Koseki Bijou, Nerissa Ravencroft, Fuwawa Abyssgard, Mococo Abyssgard
+- hololive EN Justice: Elizabeth Rose Bloodflame, Gigi Murin, Cecilia Immergreen, Raora Panthera
+- hololive DEV_IS ReGLOSS: Otonose Kanade, Ichijou Ririka, Juufuutei Raden, Todoroki Hajime, Hiodoshi Ao
+- hololive DEV_IS FLOW GLOW: Isaki Riona, Koganei Niko, Mizumiya Su, Rindo Chihaya, Kikirara Vivi
+
+### COMMON NICKNAMES
+- "Chiha" or "Chihaya" → Rindo Chihaya
+- "Su-chan" or "Su" → Mizumiya Su
+- "Marine" or "Senchou" → Houshou Marine
+- "Noel" or "Danchou" → Shirogane Noel
+- "Miko" or "Mikochi" → Sakura Miko
+- "Suisei" or "Suichan" → Hoshimachi Suisei
+- "Korone" or "Korosan" → Inugami Korone
+- "Subaru" or "Suba-chan" → Oozora Subaru
+- "Aqua" or "Akutan" → Minato Aqua
+- "Towa" or "Towa-sama" → Tokoyami Towa
+- "Lamy" or "Lamy-chan" → Yukihana Lamy
+- "Botan" or "Shishiron" → Shishiro Botan
+- "Nene" or "Nenechi" → Momosuzu Nene
+
+### TASK
+Translate the following Japanese subtitle segments into natural, colloquial English.
+Keep VTuber energy — translate 'yabe', 'sugoi', 'kawaii' idiomatically, not literally.
+Never translate in isolation — use context from surrounding lines for pronouns, tense, and tone.
+If a segment is already in English, keep it as-is.
+Return ONLY a valid JSON array with one translated string per input segment, in the same order.
+No markdown, no extra keys — just a JSON array of strings."""
+
+    BATCH = 60  # segments per Gemini call
+    entries = []
+    total   = len(segments)
+
+    for batch_start in range(0, total, BATCH):
+        batch = segments[batch_start:batch_start + BATCH]
+        lines = [s["text"] for s in batch]
+        user_msg = "Translate these segments:\n" + _json.dumps(lines, ensure_ascii=False)
+
+        translations = lines  # default fallback — keeps Japanese if all attempts fail
+        for attempt in range(5):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=[user_msg],
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        max_output_tokens=8192,
+                        response_mime_type="application/json",
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    ),
+                )
+                raw = response.text.strip()
+                raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw).strip()
+                translations = _json.loads(raw)
+                if not isinstance(translations, list):
+                    raise ValueError("Expected JSON array")
+                break
+            except Exception as e:
+                err = str(e)
+                is_rate = "429" in err or "quota" in err.lower() or "rate" in err.lower()
+                if is_rate and attempt < 4:
+                    wait = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS)-1)]
+                    log(f"⏳  Rate limited on translation batch — waiting {wait}s…")
+                    time.sleep(wait)
+                elif attempt < 4:
+                    time.sleep(10)
+                else:
+                    log(f"⚠️  Translation batch failed: {err[:100]} — using original Japanese")
+                    translations = lines
+
+        for j, seg in enumerate(batch):
+            translated = translations[j] if j < len(translations) else seg["text"]
+            entries.append({
+                "start_ms": seg["start_ms"],
+                "end_ms":   seg["end_ms"],
+                "text":     str(translated).strip(),
+            })
+
+        done = min(batch_start + BATCH, total)
+        progress_cb(done, total)
+        log(f"📝  Translated {done}/{total} segments…")
+
+    try:
+        with open(trans_cache, "w", encoding="utf-8") as f:
+            _json.dump({"prompt_version": PROMPT_VERSION, "entries": entries}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+    return entries
+
+def transcribe_local(source_path, task, api_key, title,
+                     skip_secs, resume_dir, tmp_dir, model, log, progress_cb):
+    """Local pipeline: faster-whisper transcription + Gemini text translation."""
+    os.makedirs(resume_dir, exist_ok=True)
+
+    # 1. Extract audio
+    audio_path = os.path.join(tmp_dir, "audio.wav")
+    log("🎵  Extracting audio…")
+    if not extract_audio(source_path, audio_path, skip_secs, log):
+        return []
+
+    # 2. Whisper transcription
+    log("🎤  Starting Whisper transcription…")
+    segments = transcribe_with_whisper(audio_path, resume_dir, skip_secs, log,
+                                       lambda d, t: progress_cb(int(d/t*50) if t else 0, 100))
+    if not segments:
+        return []
+
+    # 3. Translate or return as-is
+    if task == "translate":
+        log(f"🌐  Translating {len(segments)} segments with Gemini…")
+        entries = translate_with_gemini(segments, title, api_key, model, resume_dir, log,
+                                        lambda d, t: progress_cb(50 + int(d/t*50) if t else 50, 100))
+    else:
+        entries = segments
+        progress_cb(100, 100)
+
+    return entries
+
+def run_pipeline(source, is_url, task, api_key, outdir, skip_mins, model, mode,
                  log, progress_cb, done_cb):
     tmp = None
     try:
@@ -913,10 +1259,16 @@ def run_pipeline(source, is_url, task, api_key, outdir, skip_mins, model,
         os.makedirs(video_dir, exist_ok=True)
         log(f"📁  Output: {video_dir}")
 
-        entries = transcribe_with_gemini(
-            source_path, task, api_key, title,
-            int(skip_mins * 60), resume_dir, tmp, model, log, progress_cb
-        )
+        if mode == "local":
+            entries = transcribe_local(
+                source_path, task, api_key, title,
+                int(skip_mins * 60), resume_dir, tmp, model, log, progress_cb
+            )
+        else:
+            entries = transcribe_with_gemini(
+                source_path, task, api_key, title,
+                int(skip_mins * 60), resume_dir, tmp, model, log, progress_cb
+            )
 
         if not entries:
             log("❌  No subtitles returned — check log above.")
@@ -1055,6 +1407,18 @@ class HoloSubApp(tk.Tk):
                        bg=CARD, fg=TEXT, selectcolor=CARD,
                        activebackground=CARD, font=FONT_B).pack(anchor="w")
 
+        tk.Label(tcard, text="", bg=CARD).pack()  # spacer
+        tk.Label(tcard, text="Processing mode", font=FONT_S, bg=CARD, fg=SUBTEXT).pack(anchor="w")
+        self.mode_var = tk.StringVar(value="gemini")
+        tk.Radiobutton(tcard, text="Gemini (cloud)",
+                       variable=self.mode_var, value="gemini",
+                       bg=CARD, fg=TEXT, selectcolor=CARD,
+                       activebackground=CARD, font=FONT_B).pack(anchor="w")
+        tk.Radiobutton(tcard, text="Local (Whisper + Gemini)",
+                       variable=self.mode_var, value="local",
+                       bg=CARD, fg=TEXT, selectcolor=CARD,
+                       activebackground=CARD, font=FONT_B).pack(anchor="w")
+
         rcol = tk.Frame(srow, bg=BG)
         rcol.pack(side="left", fill="both", expand=True, padx=(8, 0))
 
@@ -1153,8 +1517,14 @@ class HoloSubApp(tk.Tk):
         self.log_box = scrolledtext.ScrolledText(
             self, font=FONT_MONO, bg="#08080f", fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0,
-            state="disabled", height=12)
+            state="disabled", height=12,
+            cursor="arrow")
         self.log_box.pack(fill="both", expand=True, padx=20, pady=(4, 16))
+        # Allow selecting and copying log text
+        self.log_box.bind("<Control-a>", lambda e: (self.log_box.configure(state="normal"),
+                                                     self.log_box.tag_add("sel", "1.0", "end"),
+                                                     self.log_box.configure(state="disabled"), "break"))
+        self.log_box.bind("<Control-c>", lambda e: None)
         self._log(f"Ready. Paste a URL or pick a file, enter your Gemini API key, and go.\n"
                   f"Default model: {GEMINI_MODEL}  |  Encoder: {_ENCODER}\n")
 
@@ -1185,7 +1555,10 @@ class HoloSubApp(tk.Tk):
         if total:
             pct = min(100.0, done / total * 100)
             self.progress_var.set(pct)
-            self.prog_label.config(text=f"Chunk {done}/{total}  ({pct:.0f}%)")
+            if total == 100:
+                self.prog_label.config(text=f"{pct:.0f}%")
+            else:
+                self.prog_label.config(text=f"Chunk {done}/{total}  ({pct:.0f}%)")
 
     def _start(self):
         source  = self.source_var.get().strip()
@@ -1217,8 +1590,19 @@ class HoloSubApp(tk.Tk):
 
         is_url    = source.startswith("http://") or source.startswith("https://")
         task      = self.task_var.get()
+        mode      = self.mode_var.get()
         skip_mins = self.skip_min_var.get() + self.skip_sec_var.get() / 60.0
         model     = self._model_map.get(self._model_cb.get(), GEMINI_MODEL)
+
+        # Check faster-whisper is installed if local mode selected
+        if mode == "local":
+            try:
+                import faster_whisper
+            except ImportError:
+                messagebox.showerror("Missing package",
+                                     "Local mode requires faster-whisper.\n\n"
+                                     "Run:\n  pip install faster-whisper\nThen restart holoSub.")
+                return
 
         self.run_btn.configure(state="disabled", text="⏳  Validating key…")
         self._log("🔑  Validating Gemini API key…")
@@ -1226,8 +1610,9 @@ class HoloSubApp(tk.Tk):
         def validate_and_run():
             ok, err_msg = validate_api_key(api_key, model)
             if not ok:
+                short_msg = err_msg.split("\n")[0]  # first line only for the status label
                 self.after(0, self._log, f"❌  {err_msg}")
-                self.after(0, self._api_status.config, {"text": f"⚠  {err_msg}", "fg": WARN})
+                self.after(0, self._api_status.config, {"text": f"⚠  {short_msg}", "fg": WARN})
                 self.after(0, self.run_btn.configure,
                            {"state": "normal", "text": "✦  Generate subtitles"})
                 return
@@ -1238,11 +1623,11 @@ class HoloSubApp(tk.Tk):
             self.after(0, self.progress_var.set, 0)
             self.after(0, self.prog_label.config, {"text": ""})
             self.after(0, self._log,
-                       f"▶ Source={'URL' if is_url else 'file'}  task={task}  skip={skip_mins}min  model={model}")
+                       f"▶ Source={'URL' if is_url else 'file'}  task={task}  mode={mode}  skip={skip_mins:.1f}min  model={model}")
 
             threading.Thread(
                 target=run_pipeline,
-                args=(source, is_url, task, api_key, outdir, skip_mins, model,
+                args=(source, is_url, task, api_key, outdir, skip_mins, model, mode,
                       lambda m: self.after(0, self._log, m),
                       lambda d, t: self.after(0, self._set_progress, d, t),
                       self._on_done),

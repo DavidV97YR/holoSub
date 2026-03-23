@@ -22,6 +22,12 @@ FFmpeg is needed in two ways — `static-ffmpeg` (installed via pip in step 3) h
 pip install google-genai yt-dlp static-ffmpeg
 ```
 
+For **Local mode** (optional), install faster-whisper and CUDA Toolkit 12:
+```
+pip install faster-whisper
+```
+Then install CUDA Toolkit 12 from https://developer.nvidia.com/cuda-downloads (required for GPU acceleration).
+
 ### 4. Get a Gemini API key
 1. Go to https://aistudio.google.com
 2. Sign in with a Google account
@@ -53,11 +59,17 @@ python holoSub.py
    - **English (translate + localise)** — translates JP → EN with natural VTuber-aware phrasing ✅
    - **Japanese (keep original)** — accurate JP transcript
 
-5. **Skip intro** — optional, defaults to 0. Set the minutes and seconds if you want to skip a waiting room or pre-stream countdown at the start.
+5. **Processing mode:**
+   - **Gemini (cloud)** — sends video chunks to Gemini for transcription and translation. No local setup needed.
+   - **Local (Whisper + Gemini)** — transcribes audio locally using faster-whisper on your GPU, then sends the Japanese text to Gemini for translation only. No rate limiting, faster on long streams, requires CUDA Toolkit 12 and faster-whisper installed.
 
-6. **Pick your save folder** (defaults to Desktop)
+   **Local mode is recommended** if you have an Nvidia GPU. Whisper produces more accurate timestamps than Gemini's video-based estimates, and sending a text transcript to Gemini is far lighter than uploading video chunks — meaning less API usage, no rate limiting, and faster overall processing.
 
-7. Click **✦ Generate subtitles** to create an `.srt` subtitle file  
+6. **Skip intro** — optional, defaults to 0. Set the minutes and seconds if you want to skip a waiting room or pre-stream countdown at the start.
+
+7. **Pick your save folder** (defaults to Desktop)
+
+8. Click **✦ Generate subtitles** to create an `.srt` subtitle file  
    OR click **⬇ Download video** to download the video in best available quality
 
 holoSub automatically creates a subfolder named after the video, keeping subtitles and downloads organised together. The `.srt` file is named to match the video file so MPC auto-loads it without any manual steps.
@@ -78,13 +90,20 @@ holoSub in action — Mizumiya Su & Rindo Chihaya's PC license stream, and Isaki
 
 ## How It Works
 
+### Gemini (cloud) mode
 holoSub processes video in 3-minute chunks and sends each one to Gemini. Gemini uses both the visuals and audio to generate accurate subtitles — this means it can read on-screen text, understand context from what's happening in the video, and correctly handle speech during gameplay, ads, cutscenes, intros, and outros.
 
 The 3-minute chunk size was arrived at through testing. We started at 20-minute chunks, then tried 10 minutes and 5 minutes, and found that the smaller the chunks, the better Gemini is at placing timestamps accurately. Shorter chunks give Gemini a tighter window to work within, reducing the chance of subtitles drifting out of sync.
 
 Subtitles are generated for any voice that is heard — live speech, singing during an intro or outro, or commentary over any type of content. The only time holoSub stays silent is during pure instrumental music or ambience with no voice at all.
 
-A `.resume` folder is saved inside the video's output folder during processing. If the run is interrupted you can re-run on the same URL and it will skip already-completed chunks. Delete the `.resume` folder to force a full reprocess.
+### Local (Whisper + Gemini) mode
+holoSub extracts the full audio from the video and runs it through faster-whisper large-v3 on your GPU locally. This produces a precise Japanese transcript with word-level timestamps. The transcript is then sent to Gemini in batches for translation into English — no video is uploaded, so there are no rate limits and processing is significantly faster on long streams.
+
+This mode requires an Nvidia GPU with CUDA Toolkit 12 installed. The large-v3 model (~3GB) is downloaded automatically on first use and cached locally.
+
+### Resume system
+A `.resume` folder is saved inside the video's output folder during processing. If the run is interrupted you can re-run on the same URL and it will skip already-completed work. Delete the `.resume` folder to force a full reprocess.
 
 ---
 
