@@ -405,7 +405,7 @@ def validate_api_key(api_key, model=GEMINI_MODEL):
 
 # ── prompt ────────────────────────────────────────────────────────────────────
 
-PROMPT_VERSION = 11  # bump to invalidate resume cache on prompt change
+PROMPT_VERSION = 12  # bump to invalidate resume cache on prompt change
 
 def make_instruction(task, title):
     ctx = f"Video title: {title}." if title else ""
@@ -452,7 +452,11 @@ These are the EXACT correct romanisations — never mishear or mis-romanise thes
 - hololive DEV_IS ReGLOSS: Otonose Kanade, Ichijou Ririka, Juufuutei Raden, Todoroki Hajime, Hiodoshi Ao
 - hololive DEV_IS FLOW GLOW: Isaki Riona, Koganei Niko, Mizumiya Su, Rindo Chihaya, Kikirara Vivi
 
-### COMMON NICKNAMES & ALTERNATE READINGS
+### INDIE VTUBER REFERENCE
+These indie VTubers may appear as guests or collaborators — use exact romanisations:
+- Amagai Ruka (雨海ルカ)
+- Kurageu Roa (海月雲ろあ)
+- Appare Hinata (天晴ひなた)
 Streamers frequently call each other by shortened names. Map these to their correct full names:
 - "Chiha" or "Chihaya" → Rindo Chihaya
 - "Su-chan" or "Su" → Mizumiya Su
@@ -1127,6 +1131,12 @@ These are the EXACT correct romanisations — never mis-romanise these names:
 - hololive DEV_IS ReGLOSS: Otonose Kanade, Ichijou Ririka, Juufuutei Raden, Todoroki Hajime, Hiodoshi Ao
 - hololive DEV_IS FLOW GLOW: Isaki Riona, Koganei Niko, Mizumiya Su, Rindo Chihaya, Kikirara Vivi
 
+### INDIE VTUBER REFERENCE
+These indie VTubers may appear as guests or collaborators — use exact romanisations:
+- Amagai Ruka (雨海ルカ)
+- Kurageu Roa (海月雲ろあ)
+- Appare Hinata (天晴ひなた)
+
 ### COMMON NICKNAMES
 - "Chiha" or "Chihaya" → Rindo Chihaya
 - "Su-chan" or "Su" → Mizumiya Su
@@ -1278,14 +1288,18 @@ def run_pipeline(source, is_url, task, api_key, outdir, skip_mins, model, mode,
         srt = build_srt(entries)
 
         # Try to match the .srt filename to any existing video file in video_dir
-        # so MPC-HC auto-loads it without manual selection
+        # so MPC-HC auto-loads it without manual selection.
+        # Fall back to the sanitised title if no video found yet.
         srt_name = safe_title  # fallback
         for f in os.listdir(video_dir):
             ext = os.path.splitext(f)[1].lower()
             if ext in (".mp4", ".mkv", ".webm", ".avi", ".mov"):
-                srt_name = os.path.splitext(f)[0]
+                srt_name = os.path.splitext(f)[0]  # exact video filename including brackets
                 log(f"🔗  Matching .srt name to video: {f}")
                 break
+        else:
+            # No video in folder yet — use full title to match what yt-dlp will name it
+            srt_name = re.sub(r'[\\/*?:"<>|]', '', title).strip() or safe_title
 
         out_file = os.path.join(video_dir, f"{srt_name}.srt")
         with open(out_file, "w", encoding="utf-8") as f:
@@ -1656,11 +1670,20 @@ class HoloSubApp(tk.Tk):
         def do_dl():
             try:
                 import yt_dlp
+                _ansi = re.compile(r'\x1b\[[0-9;]*m')
+                last_pct = [-1]
 
                 def progress_hook(d):
                     if d.get("status") == "downloading":
-                        msg = f"   {d.get('_percent_str','').strip()}  {d.get('_speed_str','').strip()}"
-                        self.after(0, self._log, msg)
+                        downloaded = d.get("downloaded_bytes", 0)
+                        total      = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+                        speed      = _ansi.sub("", d.get("_speed_str", "")).strip()
+                        eta        = _ansi.sub("", d.get("_eta_str", "")).strip()
+                        if total and total > 0:
+                            pct = int(downloaded / total * 100)
+                            if pct // 5 > last_pct[0]:
+                                last_pct[0] = pct // 5
+                                self.after(0, self._log, f"   {pct}%  {speed}  ETA {eta}")
 
                 with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
                     info = ydl.extract_info(source, download=False)
