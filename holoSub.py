@@ -1006,9 +1006,10 @@ segs, info = model.transcribe(
 segments = []
 total_duration = info.duration if hasattr(info, "duration") else 0
 for seg in segs:
-    start_ms = int((seg.start + skip_secs) * 1000)
-    end_ms   = int((seg.end   + skip_secs) * 1000)
-    text     = seg.text.strip()
+    start_ms      = int((seg.start + skip_secs) * 1000)
+    last_word_end = seg.words[-1].end if seg.words else seg.start + len(seg.text.strip()) * 0.06
+    end_ms        = int((last_word_end + skip_secs) * 1000)
+    text          = seg.text.strip()
     if text:
         segments.append({{"start_ms": start_ms, "end_ms": end_ms, "text": text}})
     if total_duration > 0:
@@ -1298,8 +1299,21 @@ def run_pipeline(source, is_url, task, api_key, outdir, skip_mins, model, mode,
                 log(f"🔗  Matching .srt name to video: {f}")
                 break
         else:
-            # No video in folder yet — use full title to match what yt-dlp will name it
-            srt_name = re.sub(r'[\\/*?:"<>|]', '', title).strip() or safe_title
+            # No video in folder yet — use full title to match what yt-dlp will name it.
+            # yt-dlp replaces unsafe chars with full-width unicode equivalents rather than
+            # stripping them, so we mirror that here to guarantee the names match.
+            _YTDLP_REPLACEMENTS = {
+                '/':  '\u29f8',  # ⧸
+                '\\': '\u29f9',  # ⧹
+                '"':  '\uff02',  # ＂
+                '*':  '\uff0a',  # ＊
+                ':':  '\uff1a',  # ：
+                '<':  '\uff1c',  # ＜
+                '>':  '\uff1e',  # ＞
+                '?':  '\uff1f',  # ？
+                '|':  '\uff5c',  # ｜
+            }
+            srt_name = ''.join(_YTDLP_REPLACEMENTS.get(c, c) for c in title).strip() or safe_title
 
         out_file = os.path.join(video_dir, f"{srt_name}.srt")
         with open(out_file, "w", encoding="utf-8") as f:
