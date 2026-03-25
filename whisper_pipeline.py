@@ -10,10 +10,10 @@ from prompt import _HOLOLIVE_NAMES
 from ffmpeg_utils import extract_audio
 
 
-def transcribe_with_whisper(audio_path, resume_dir, audio_start_secs, log, progress_cb):
+def transcribe_with_whisper(audio_path, resume_dir, silence_secs, log, progress_cb):
     """Run faster-whisper in a subprocess. Returns list of {start_ms, end_ms, text}
-    with timestamps relative to the WAV file start (i.e. relative to audio_start_secs
-    in the original video). The caller is responsible for adding the offset back."""
+    with timestamps in original video time (audio is extracted from t=0 with the
+    intro silenced, so no offset is needed)."""
     whisper_cache = os.path.join(resume_dir, "whisper_transcript.json")
     if os.path.exists(whisper_cache):
         try:
@@ -21,7 +21,7 @@ def transcribe_with_whisper(audio_path, resume_dir, audio_start_secs, log, progr
                 data = json.load(f)
             if (isinstance(data, dict) and
                     data.get("whisper_version") == PROMPT_VERSION and
-                    abs(data.get("audio_start_secs", -1) - audio_start_secs) < 0.5):
+                    abs(data.get("silence_secs", -1) - silence_secs) < 0.5):
                 segments = data.get("segments", [])
                 log(f"⏭️  Whisper: loaded from cache ({len(segments)} segments)")
                 return segments
@@ -44,9 +44,9 @@ except ImportError:
     print(json.dumps({{"error": "faster-whisper not installed"}}))
     sys.exit(1)
 
-audio_path       = {repr(audio_path)}
-output_path      = {repr(whisper_cache)}
-audio_start_secs = {audio_start_secs}
+audio_path    = {repr(audio_path)}
+output_path   = {repr(whisper_cache)}
+silence_secs  = {silence_secs}
 
 try:
     model = WhisperModel("large-v3", device="cuda", compute_type="float16")
@@ -62,29 +62,15 @@ segs, info = model.transcribe(
     language="ja",
     beam_size=5,
     word_timestamps=True,
-    condition_on_previous_text=False,
     vad_filter=True,
-    vad_parameters={{
-        "threshold":               0.35,
-        "min_silence_duration_ms": 250,
-        "min_speech_duration_ms":  250,
-        "speech_pad_ms":           200,
-    }},
+    vad_parameters={{"min_silence_duration_ms": 500}},
 )
 
 segments = []
 total_duration = info.duration if hasattr(info, "duration") else 0
 for seg in segs:
-    if seg.words:
-        raw_word_start = seg.words[0].start
-        word_start     = max(raw_word_start, seg.start)
-        word_end       = seg.words[-1].end
-    else:
-        word_start = seg.start
-        word_end   = seg.end
-
-    start_ms = int(word_start * 1000)
-    end_ms   = int(word_end   * 1000)
+    start_ms = int(seg.start * 1000)
+    end_ms   = int(seg.end   * 1000)
     text = seg.text.strip()
     if text:
         segments.append({{"start_ms": start_ms, "end_ms": end_ms, "text": text}})
@@ -95,29 +81,8 @@ for seg in segs:
         if elapsed_mins % 5 == 0:
             print(f"PROGRESS {{elapsed_mins}} {{total_mins}} {{pct}}", flush=True)
 
-# ── rapid-alternation multi-speaker detection ──────────────────────────────
-RAPID_GAP_MS = 400
-merged_segs  = []
-i = 0
-while i < len(segments):
-    seg = segments[i]
-    if (i + 2 < len(segments) and
-        segments[i+1]["end_ms"] - segments[i+1]["start_ms"] < 1500 and
-        segments[i]["end_ms"] + RAPID_GAP_MS > segments[i+1]["start_ms"] and
-        segments[i+1]["end_ms"] + RAPID_GAP_MS > segments[i+2]["start_ms"]):
-        combined_start = min(segments[i]["start_ms"],   segments[i+1]["start_ms"])
-        combined_end   = max(segments[i]["end_ms"],     segments[i+1]["end_ms"])
-        combined_text  = segments[i]["text"] + "\\n" + segments[i+1]["text"]
-        merged_segs.append({{"start_ms": combined_start, "end_ms": combined_end, "text": combined_text}})
-        i += 2
-    else:
-        merged_segs.append(seg)
-        i += 1
-segments = merged_segs
-# ── end rapid-alternation detection ────────────────────────────────────────
-
 with open(output_path, "w", encoding="utf-8") as f:
-    json.dump({{"whisper_version": {PROMPT_VERSION}, "audio_start_secs": audio_start_secs, "segments": segments}}, f, ensure_ascii=False)
+    json.dump({{"whisper_version": {PROMPT_VERSION}, "silence_secs": silence_secs, "segments": segments}}, f, ensure_ascii=False)
 print(f"DONE {{len(segments)}}", flush=True)
 """
 
@@ -218,7 +183,7 @@ If a segment is already in English, keep it as-is.
 Return ONLY a valid JSON array with one translated string per input segment, in the same order.
 No markdown, no extra keys — just a JSON array of strings."""
 
-    BATCH = 60
+    BATCH = 200
     entries = []
     total   = len(segments)
 
@@ -298,46 +263,34 @@ No markdown, no extra keys — just a JSON array of strings."""
     return entries
 
 
-_WHISPER_WARMUP_SECS = 3  # seconds of pre-roll before skip point fed to Whisper
-
-
 def transcribe_local(source_path, task, api_key, title,
                      skip_secs, resume_dir, tmp_dir, model, log, progress_cb,
                      stop_event=None):
     """Local pipeline: faster-whisper transcription + Gemini text translation."""
     os.makedirs(resume_dir, exist_ok=True)
 
-    # 1. Extract audio starting a few seconds before the skip point.
-    #    Including the full intro (t=0) caused VAD to merge the intro region with
-    #    the first speech region, making Whisper skip the first ~7 s of actual
-    #    speech.  A short pre-roll (≤3 s) is enough for VAD to detect the speech
-    #    onset without saturating Whisper's context with intro music.
-    warmup_start = max(0.0, float(skip_secs) - _WHISPER_WARMUP_SECS)
+    # 1. Extract full audio from t=0 but silence the intro.
+    #    This keeps the original timeline intact (no offset math needed) while
+    #    preventing the intro music from confusing VAD/Whisper.  The old approach
+    #    of seeking past the intro changed the audio context Whisper saw, which
+    #    caused systematic timestamp drift.
     audio_path = os.path.join(tmp_dir, "audio.wav")
     log("🎵  Extracting audio…")
-    if not extract_audio(source_path, audio_path, log, start_secs=warmup_start):
+    if not extract_audio(source_path, audio_path, log, silence_secs=skip_secs):
         return []
 
     if stop_event and stop_event.is_set():
         return []
 
-    # 2. Whisper transcription (timestamps are relative to the WAV start)
+    # 2. Whisper transcription (timestamps are already in video time)
     log("🎤  Starting Whisper transcription…")
-    segments = transcribe_with_whisper(audio_path, resume_dir, warmup_start, log,
+    segments = transcribe_with_whisper(audio_path, resume_dir, skip_secs, log,
                                        lambda d, t: progress_cb(int(d/t*50) if t else 0, 100))
     if not segments:
         return []
 
-    # 3. Shift timestamps back to the original video timeline.
-    warmup_ms = int(warmup_start * 1000)
-    if warmup_ms > 0:
-        segments = [{"start_ms": s["start_ms"] + warmup_ms,
-                     "end_ms":   s["end_ms"]   + warmup_ms,
-                     "text":     s["text"]} for s in segments]
-
-    # 4. Drop any warmup segments that fall before the intended skip point.
-    #    Use start_ms (not end_ms) so a segment that merely bleeds past the
-    #    boundary isn't kept with its intro-music content.
+    # 3. Drop any segments from the silenced intro (safety measure —
+    #    VAD should ignore silence, but filter just in case).
     if skip_secs > 0:
         skip_ms = int(skip_secs * 1000)
         before  = len(segments)
@@ -349,7 +302,7 @@ def transcribe_local(source_path, task, api_key, title,
     if stop_event and stop_event.is_set():
         return []
 
-    # 3. Translate or return as-is
+    # 4. Translate or return as-is
     if task == "translate":
         log(f"🌐  Translating {len(segments)} segments with Gemini…")
         entries = translate_with_gemini(segments, title, api_key, model, resume_dir, log,

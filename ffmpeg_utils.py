@@ -168,16 +168,22 @@ def reencode_chunk(chunk_path, log):
         return chunk_path
 
 
-def extract_audio(source_path, out_path, log, start_secs=0):
+def extract_audio(source_path, out_path, log, start_secs=0, silence_secs=0):
     """Extract audio from video as 16kHz mono WAV for Whisper.
-    start_secs: begin extraction here (fast seek); caller must add this offset
-    back to all Whisper timestamps so they align with the original video timeline.
+    silence_secs: mute the first N seconds (intro) so VAD ignores them
+                  while keeping the full timeline intact (no offset needed).
+    start_secs:   legacy seek parameter (kept for compatibility).
     """
     seek_args = ["-ss", str(start_secs)] if start_secs > 0 else []
+    af_args = []
+    if silence_secs > 0:
+        af_args = ["-af", f"volume=0:enable='lt(t,{silence_secs})'"]
     cmd = ["ffmpeg", "-y", "-loglevel", "error",
            *seek_args,
            "-i", str(source_path),
-           "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", out_path]
+           "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+           *af_args,
+           out_path]
     try:
         subprocess.run(cmd, check=True, capture_output=True, timeout=600)
         log(f"🎵  Audio extracted")

@@ -19,7 +19,7 @@ FFmpeg is needed in two ways — `static-ffmpeg` (installed via pip in step 3) h
 
 ### 3. Install packages
 ```
-pip install google-genai yt-dlp static-ffmpeg
+pip install -r requirements.txt
 ```
 
 For **Local mode** (optional), install faster-whisper and CUDA Toolkit 12:
@@ -98,12 +98,9 @@ The 3-minute chunk size was arrived at through testing. We started at 20-minute 
 Subtitles are generated for any voice that is heard — live speech, singing during an intro or outro, or commentary over any type of content. The only time holoSub stays silent is during pure instrumental music or ambience with no voice at all.
 
 ### Local (Whisper + Gemini) mode
-holoSub extracts audio starting a few seconds before the skip point and runs it through faster-whisper large-v3 on your GPU locally. This produces a precise Japanese transcript with word-level timestamps. The transcript is then sent to Gemini in batches for translation into English — no video is uploaded, so there are no rate limits and processing is significantly faster on long streams.
+holoSub extracts the full audio and silences the intro period (if skip is set) so that VAD ignores it while keeping the original timeline intact — no timestamp offsets needed. The audio is then run through faster-whisper large-v3 on your GPU locally, producing a precise Japanese transcript with segment-level timestamps. The transcript is sent to Gemini in batches for translation into English — no video is uploaded, so there are no rate limits and processing is significantly faster on long streams.
 
-Timestamp accuracy in Local mode is achieved through several tuned settings:
-- Whisper runs with `condition_on_previous_text=False` so each speech region is decoded independently, preventing timestamp drift across long streams
-- The VAD (voice activity detection) uses a conservative threshold to avoid triggering early on background game audio, and minimal pre-speech padding so subtitle timings land on the actual first word rather than the silence before it
-- Word-level timestamps from Whisper are used for subtitle start times, clamped to the segment boundary to prevent DTW alignment noise from pulling a subtitle early
+Timestamp accuracy in Local mode relies on Whisper's segment-level timestamps with Silero VAD filtering (`min_silence_duration_ms=500`, default threshold). Short subtitle segments are given a minimum display duration and, when back-to-back in rapid dialog, overlapping entries are merged into multi-line windows by a sweep-line resolver that supports up to 4 simultaneous speakers.
 
 This mode requires an Nvidia GPU with CUDA Toolkit 12 installed. The large-v3 model (~3GB) is downloaded automatically on first use and cached locally.
 

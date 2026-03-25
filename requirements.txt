@@ -1,0 +1,4 @@
+google-genai
+yt-dlp
+static-ffmpeg
+faster-whisper

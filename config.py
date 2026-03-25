@@ -22,5 +22,5 @@ REENCODE_FPS        = 1
 REENCODE_ABR        = "16000"
 REENCODE_BITRATE_KB = 35        # ~35 KB/s video
 RETRY_DELAYS        = [30, 60, 90, 120, 150]
-PROMPT_VERSION      = 16        # bump to invalidate resume cache on prompt change
+PROMPT_VERSION      = 19        # bump to invalidate resume cache on prompt change
 MAX_LOG_LINES       = 1200      # trim log box when it exceeds this; keeps GUI responsive
