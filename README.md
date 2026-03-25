@@ -43,7 +43,7 @@ python holoSub.py
 
 ## Using holoSub
 
-1. **Paste a URL** — YouTube, Holodex, or any yt-dlp-supported link  
+1. **Paste a URL** — YouTube, Holodex, or any yt-dlp-supported link
    OR click **Browse…** to pick a local `.mp4` / `.mkv` / `.m4a` / `.webm` file
 
 2. **Paste your Gemini API key** into the key field — it's validated before any processing begins
@@ -69,7 +69,7 @@ python holoSub.py
 
 7. **Pick your save folder** (defaults to Desktop)
 
-8. Click **✦ Generate subtitles** to create an `.srt` subtitle file  
+8. Click **✦ Generate subtitles** to create an `.srt` subtitle file
    OR click **⬇ Download video** to download the video in best available quality
 
 holoSub automatically creates a subfolder named after the video, keeping subtitles and downloads organised together. The `.srt` file is named to match the video file so MPC auto-loads it without any manual steps.
@@ -98,7 +98,12 @@ The 3-minute chunk size was arrived at through testing. We started at 20-minute 
 Subtitles are generated for any voice that is heard — live speech, singing during an intro or outro, or commentary over any type of content. The only time holoSub stays silent is during pure instrumental music or ambience with no voice at all.
 
 ### Local (Whisper + Gemini) mode
-holoSub extracts the full audio from the video and runs it through faster-whisper large-v3 on your GPU locally. This produces a precise Japanese transcript with word-level timestamps. The transcript is then sent to Gemini in batches for translation into English — no video is uploaded, so there are no rate limits and processing is significantly faster on long streams.
+holoSub extracts audio starting a few seconds before the skip point and runs it through faster-whisper large-v3 on your GPU locally. This produces a precise Japanese transcript with word-level timestamps. The transcript is then sent to Gemini in batches for translation into English — no video is uploaded, so there are no rate limits and processing is significantly faster on long streams.
+
+Timestamp accuracy in Local mode is achieved through several tuned settings:
+- Whisper runs with `condition_on_previous_text=False` so each speech region is decoded independently, preventing timestamp drift across long streams
+- The VAD (voice activity detection) uses a conservative threshold to avoid triggering early on background game audio, and minimal pre-speech padding so subtitle timings land on the actual first word rather than the silence before it
+- Word-level timestamps from Whisper are used for subtitle start times, clamped to the segment boundary to prevent DTW alignment noise from pulling a subtitle early
 
 This mode requires an Nvidia GPU with CUDA Toolkit 12 installed. The large-v3 model (~3GB) is downloaded automatically on first use and cached locally.
 
@@ -133,4 +138,3 @@ A `.resume` folder is saved inside the video's output folder during processing. 
 - **Members streams** — yt-dlp supports cookie-based auth. See the yt-dlp docs for `--cookies-from-browser`.
 - **Pricing** — Gemini 3 Flash Preview costs roughly a few cents per hour of video. Check current rates at https://ai.google.dev/pricing.
 - **AV1 playback** — if downloaded videos won't play in MPC, install LAV Filters 0.81+ from https://github.com/Nevcairiel/LAVFilters/releases. Uninstall any older version first and reboot before installing.
-
