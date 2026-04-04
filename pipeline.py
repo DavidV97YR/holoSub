@@ -1,4 +1,5 @@
 import concurrent.futures
+import json
 import os
 import re
 import shutil
@@ -138,7 +139,7 @@ def transcribe_with_gemini(source_path, task, api_key, title,
 
 
 def run_pipeline(source, is_url, task, api_key, outdir, skip_mins, model, mode,
-                 log, progress_cb, done_cb, stop_event=None):
+                 log, progress_cb, done_cb, stop_event=None, vad_filter=True):
     tmp = None
     try:
         tmp = tempfile.mkdtemp()
@@ -160,11 +161,29 @@ def run_pipeline(source, is_url, task, api_key, outdir, skip_mins, model, mode,
         os.makedirs(video_dir, exist_ok=True)
         log(f"📁  Output: {video_dir}")
 
-        if mode == "local":
+        # Save processing metadata so the Resub tab can auto-detect settings
+        os.makedirs(resume_dir, exist_ok=True)
+        meta_path = os.path.join(resume_dir, "_meta.json")
+        try:
+            with open(meta_path, "w", encoding="utf-8") as mf:
+                json.dump({
+                    "skip_secs": int(skip_mins * 60),
+                    "mode": mode,
+                    "task": task,
+                    "title": title,
+                    "model": model,
+                    "vad_filter": vad_filter,
+                }, mf)
+        except Exception:
+            pass
+
+        if mode in ("local", "local_only"):
+            translator = "ollama" if mode == "local_only" else "gemini"
             entries = transcribe_local(
                 source_path, task, api_key, title,
                 int(skip_mins * 60), resume_dir, tmp, model, log, progress_cb,
-                stop_event=stop_event
+                stop_event=stop_event, translator=translator,
+                vad_filter=vad_filter,
             )
         else:
             entries = transcribe_with_gemini(

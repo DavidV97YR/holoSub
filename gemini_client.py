@@ -4,7 +4,6 @@ import threading
 import time
 
 from config import GEMINI_MODEL, RETRY_DELAYS, PROMPT_VERSION
-from ffmpeg_utils import get_duration
 from prompt import _GEMINI_RESPONSE_SCHEMA, parse_response
 
 
@@ -119,7 +118,7 @@ def process_chunk(i, chunk_path, offset_ms, chunk_duration_ms, instruction, resu
         return i, []
 
     strict_prefix = (
-        'Return ONLY a valid JSON object with keys "global_analysis" and "subs". '
+        'Return ONLY a valid JSON object with keys "preflight" and "cues". '
         'No markdown, no text outside JSON.\n\n'
     )
 

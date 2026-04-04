@@ -4,56 +4,150 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import ffmpeg_utils
-from config import (ACCENT, ACCENT2, BG, CARD, CARD2, FONT_B, FONT_MONO, FONT_S,
-                    GEMINI_MODEL, MAX_LOG_LINES, SUBTEXT, SUCCESS, TEXT, WARN)
+from config import (ACCENT, ACCENT2, ACCENT3, BG, BORDER, CARD, CARD2, FONT_B,
+                    FONT_MONO, FONT_S, GEMINI_MODEL, LOG_BG, MAX_LOG_LINES,
+                    SUBTEXT, SUCCESS, TEXT, WARN)
 from downloader import _make_ytdlp_progress_hook
 from gemini_client import validate_api_key
 from pipeline import _check_deps, _check_ffmpeg, run_pipeline, sanitise_folder_name
+from whisper_pipeline import check_ollama
+
+
+def _make_gradient_logo():
+    """Render 'holoSub' as a smooth-gradient PNG using Pillow."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    font_size = 52
+    # Prefer bundled Playfair Display, fall back to Georgia Bold
+    assets = os.path.join(os.path.dirname(__file__), "assets")
+    playfair = os.path.join(assets, "PlayfairDisplay-Bold.ttf")
+    try:
+        fnt = ImageFont.truetype(playfair, font_size)
+        try:
+            fnt.set_variation_by_name("Bold")
+        except Exception:
+            pass
+    except OSError:
+        fnt = ImageFont.truetype("C:/Windows/Fonts/georgiab.ttf", font_size)
+
+    # Measure each segment
+    tmp = Image.new("RGBA", (1, 1))
+    td = ImageDraw.Draw(tmp)
+    bb_holo = td.textbbox((0, 0), "holo", font=fnt)
+    bb_sub = td.textbbox((0, 0), "Sub", font=fnt)
+    w_holo = bb_holo[2] - bb_holo[0]
+    w_sub = bb_sub[2] - bb_sub[0]
+    total_w = w_holo + w_sub + 4          # small gap
+    h = max(bb_holo[3], bb_sub[3]) - min(bb_holo[1], bb_sub[1]) + 4
+
+    # Render white text on transparent background
+    img = Image.new("RGBA", (total_w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    y_off = -min(bb_holo[1], bb_sub[1])
+    draw.text((0, y_off), "holo", font=fnt, fill=(255, 255, 255, 255))
+    draw.text((w_holo + 4, y_off), "Sub", font=fnt, fill=(255, 255, 255, 255))
+
+    # Build a horizontal gradient: pink → purple over "holo", purple → cyan over "Sub"
+    pink = (255, 110, 180)
+    purple = (168, 85, 247)
+    cyan = (34, 211, 238)
+    pixels = img.load()
+    for x in range(total_w):
+        if x <= w_holo:
+            t = x / max(w_holo, 1)
+            r = int(pink[0] + (purple[0] - pink[0]) * t)
+            g = int(pink[1] + (purple[1] - pink[1]) * t)
+            b = int(pink[2] + (purple[2] - pink[2]) * t)
+        else:
+            t = (x - w_holo) / max(w_sub + 4, 1)
+            r = int(purple[0] + (cyan[0] - purple[0]) * t)
+            g = int(purple[1] + (cyan[1] - purple[1]) * t)
+            b = int(purple[2] + (cyan[2] - purple[2]) * t)
+        for y in range(h):
+            _, _, _, a = pixels[x, y]
+            if a > 0:
+                pixels[x, y] = (r, g, b, a)
+
+    # Scale down 2x for crispness (rendered at 2x)
+    return img
 
 
 class HoloSubApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("holoSub ✦ Auto Subtitle Generator")
-        self.geometry("780x790")
+        self.title("holoSub \u2726 Auto Subtitle Generator")
+        self.geometry("1000x860")
         self.resizable(True, True)
         self.configure(bg=BG)
         self._stop_event = threading.Event()
         self._build_ui()
 
     def _build_ui(self):
+        # ── Shared styles ──
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure("Holo.Horizontal.TProgressbar",
+                        troughcolor=CARD, background=ACCENT,
+                        lightcolor=ACCENT, darkcolor=ACCENT2, bordercolor=BG)
+        style.configure("TNotebook", background=BG, borderwidth=0)
+        style.configure("TNotebook.Tab", background=CARD, foreground=SUBTEXT,
+                        padding=[16, 7], font=("Segoe UI", 10, "bold"))
+        style.map("TNotebook.Tab",
+                  background=[("selected", ACCENT)],
+                  foreground=[("selected", BG)])
+
+        # ── Notebook ──
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True)
+
+        gen_frame = tk.Frame(notebook, bg=BG)
+        notebook.add(gen_frame, text="  \u2726 Generate  ")
+        self._build_main_tab(gen_frame)
+
+        from resub_tab import ResubTab
+        self.resub_tab = ResubTab(notebook, self)
+        notebook.add(self.resub_tab, text="  \U0001f504 Resub  ")
+
+    # ── Generate tab ─────────────────────────────────────────────────────────
+
+    def _build_main_tab(self, p):
         # Header
-        hdr = tk.Frame(self, bg=BG)
+        hdr = tk.Frame(p, bg=BG)
         hdr.pack(fill="x", padx=24, pady=(20, 2))
-        logo_font = ("Segoe UI", 26, "bold")
-        c = tk.Canvas(hdr, bg=BG, highlightthickness=0, height=38, width=500)
+        from PIL import Image, ImageTk
+        logo_pil = _make_gradient_logo()
+        # Scale to fit ~38px tall
+        scale_h = 38
+        scale_w = int(logo_pil.width * scale_h / logo_pil.height)
+        logo_pil = logo_pil.resize((scale_w, scale_h), Image.LANCZOS)
+        self._logo_img = ImageTk.PhotoImage(logo_pil)
+        c = tk.Canvas(hdr, bg=BG, highlightthickness=0, height=40, width=500)
         c.pack(side="left")
-        c.create_text(0,   19, text="holo", font=logo_font, fill=ACCENT,  anchor="w")
-        c.create_text(72,  19, text="Sub",  font=logo_font, fill=ACCENT2, anchor="w")
-        c.create_text(140, 22, text="✦  Auto Subtitle Generator",
-                      font=("Segoe UI", 13), fill=SUBTEXT, anchor="w")
-        tk.Label(self, text="Paste a YouTube / Holodex URL, or pick a local video/audio file.",
+        c.create_image(0, 20, image=self._logo_img, anchor="w")
+        c.create_text(scale_w + 10, 22, text="\u2726  Auto Subtitle Generator",
+                      font=("Segoe UI", 11), fill=SUBTEXT, anchor="w")
+        tk.Label(p, text="Paste a YouTube / Holodex URL, or pick a local video/audio file.",
                  font=FONT_S, bg=BG, fg=SUBTEXT).pack(anchor="w", padx=26, pady=(0, 10))
 
         # API key
-        self._section("Gemini API key")
-        acard = tk.Frame(self, bg=CARD, padx=16, pady=12)
+        self._section("Gemini API key", p)
+        acard = tk.Frame(p, bg=CARD, padx=16, pady=12)
         acard.pack(fill="x", padx=20, pady=(0, 10))
         self.apikey_var = tk.StringVar()
-        tk.Entry(acard, textvariable=self.apikey_var, show="•",
+        tk.Entry(acard, textvariable=self.apikey_var, show="\u2022",
                  font=FONT_B, bg=CARD2, fg=TEXT, insertbackground=TEXT,
                  relief="flat", bd=0, highlightthickness=1,
-                 highlightcolor=ACCENT, highlightbackground="#333"
+                 highlightcolor=ACCENT, highlightbackground=BORDER
                  ).pack(fill="x", ipady=6)
         self._api_status = tk.Label(
             acard,
-            text="Get a free key at aistudio.google.com — never stored outside this session.",
+            text="Get a free key at aistudio.google.com \u2014 never stored outside this session.",
             font=("Segoe UI", 8), bg=CARD, fg=SUBTEXT)
         self._api_status.pack(anchor="w", pady=(4, 0))
 
         # Source
-        self._section("Source")
-        scard = tk.Frame(self, bg=CARD, padx=16, pady=12)
+        self._section("Source", p)
+        scard = tk.Frame(p, bg=CARD, padx=16, pady=12)
         scard.pack(fill="x", padx=20, pady=(0, 10))
         self.source_var = tk.StringVar()
         src_row = tk.Frame(scard, bg=CARD)
@@ -61,15 +155,15 @@ class HoloSubApp(tk.Tk):
         tk.Entry(src_row, textvariable=self.source_var, font=FONT_B,
                  bg=CARD2, fg=TEXT, insertbackground=TEXT,
                  relief="flat", bd=0, highlightthickness=1,
-                 highlightcolor=ACCENT, highlightbackground="#333"
+                 highlightcolor=ACCENT, highlightbackground=BORDER
                  ).pack(side="left", fill="x", expand=True, ipady=6)
-        tk.Button(src_row, text="Browse…", font=FONT_S, bg=CARD, fg=ACCENT,
+        tk.Button(src_row, text="Browse\u2026", font=FONT_S, bg=CARD, fg=ACCENT,
                   activebackground=CARD, activeforeground=ACCENT2,
                   relief="flat", cursor="hand2", padx=8,
                   command=self._browse_file).pack(side="left", padx=(8, 0))
 
         # Settings row
-        srow = tk.Frame(self, bg=BG)
+        srow = tk.Frame(p, bg=BG)
         srow.pack(fill="x", padx=20, pady=(0, 10))
 
         tcard = tk.Frame(srow, bg=CARD, padx=14, pady=10)
@@ -88,12 +182,17 @@ class HoloSubApp(tk.Tk):
         tk.Label(tcard, text="", bg=CARD).pack()  # spacer
         tk.Label(tcard, text="Processing mode", font=FONT_S, bg=CARD, fg=SUBTEXT).pack(anchor="w")
         self.mode_var = tk.StringVar(value="gemini")
-        tk.Radiobutton(tcard, text="Gemini (cloud)",
+        self.mode_var.trace_add("write", self._on_mode_change)
+        tk.Radiobutton(tcard, text="Cloud (Gemini)",
                        variable=self.mode_var, value="gemini",
                        bg=CARD, fg=TEXT, selectcolor=CARD,
                        activebackground=CARD, font=FONT_B).pack(anchor="w")
-        tk.Radiobutton(tcard, text="Local (Whisper + Gemini)",
+        tk.Radiobutton(tcard, text="Local/Cloud (Whisper + Gemini)",
                        variable=self.mode_var, value="local",
+                       bg=CARD, fg=TEXT, selectcolor=CARD,
+                       activebackground=CARD, font=FONT_B).pack(anchor="w")
+        tk.Radiobutton(tcard, text="Local (Whisper + Qwen3)",
+                       variable=self.mode_var, value="local_only",
                        bg=CARD, fg=TEXT, selectcolor=CARD,
                        activebackground=CARD, font=FONT_B).pack(anchor="w")
 
@@ -110,7 +209,6 @@ class HoloSubApp(tk.Tk):
         model_col = tk.Frame(top_row, bg=CARD)
         model_col.pack(side="left", fill="y", padx=(0, 16))
         tk.Label(model_col, text="Model", font=FONT_S, bg=CARD, fg=SUBTEXT).pack(anchor="w")
-        self.model_var = tk.StringVar(value="gemini-3-flash-preview")
         MODELS = [
             ("gemini-3-flash-preview",      "Gemini 3 Flash Preview"),
             ("gemini-2.5-flash",            "Gemini 2.5 Flash"),
@@ -144,6 +242,15 @@ class HoloSubApp(tk.Tk):
                    ).pack(side="left", ipady=3, padx=(4, 0))
         tk.Label(skip_row, text="s", font=FONT_S, bg=CARD, fg=SUBTEXT).pack(side="left")
 
+        vad_card = tk.Frame(rcol, bg=CARD, padx=14, pady=6)
+        self.vad_var = tk.BooleanVar(value=True)
+        self._vad_check = tk.Checkbutton(
+            vad_card, text="VAD filter (uncheck for singing / karaoke streams)",
+            variable=self.vad_var, bg=CARD, fg=TEXT, selectcolor=CARD,
+            activebackground=CARD, font=FONT_B)
+        self._vad_check.pack(anchor="w")
+        self._vad_card = vad_card
+
         ocard = tk.Frame(rcol, bg=CARD, padx=14, pady=10)
         ocard.pack(fill="x")
         tk.Label(ocard, text="Save .srt to", font=FONT_S, bg=CARD, fg=SUBTEXT).pack(anchor="w")
@@ -153,38 +260,33 @@ class HoloSubApp(tk.Tk):
         tk.Entry(od_row, textvariable=self.outdir_var, font=FONT_B,
                  bg=CARD2, fg=TEXT, insertbackground=TEXT,
                  relief="flat", bd=0, highlightthickness=1,
-                 highlightcolor=ACCENT, highlightbackground="#333"
+                 highlightcolor=ACCENT, highlightbackground=BORDER
                  ).pack(side="left", fill="x", expand=True, ipady=4)
-        tk.Button(od_row, text="Browse…", font=FONT_S, bg=CARD, fg=ACCENT,
+        tk.Button(od_row, text="Browse\u2026", font=FONT_S, bg=CARD, fg=ACCENT,
                   activebackground=CARD, activeforeground=ACCENT2,
                   relief="flat", cursor="hand2", padx=8,
                   command=self._browse_outdir).pack(side="left", padx=(8, 0))
 
         # Progress
         self.progress_var = tk.DoubleVar(value=0)
-        style = ttk.Style()
-        style.theme_use("default")
-        style.configure("Holo.Horizontal.TProgressbar",
-                        troughcolor=CARD, background=ACCENT,
-                        lightcolor=ACCENT, darkcolor=ACCENT2, bordercolor=BG)
-        ttk.Progressbar(self, variable=self.progress_var, maximum=100,
+        ttk.Progressbar(p, variable=self.progress_var, maximum=100,
                         style="Holo.Horizontal.TProgressbar"
                         ).pack(fill="x", padx=20, pady=(4, 0))
-        self.prog_label = tk.Label(self, text="", font=FONT_S, bg=BG, fg=SUBTEXT)
+        self.prog_label = tk.Label(p, text="", font=FONT_S, bg=BG, fg=SUBTEXT)
         self.prog_label.pack(anchor="w", padx=22)
 
         # Buttons
-        btn_row = tk.Frame(self, bg=BG)
+        btn_row = tk.Frame(p, bg=BG)
         btn_row.pack(fill="x", padx=20, pady=(10, 0))
         self.run_btn = tk.Button(
-            btn_row, text="✦  Generate subtitles",
+            btn_row, text="\u2726  Generate subtitles",
             font=("Segoe UI", 12, "bold"),
             bg=ACCENT, fg=BG, activebackground=ACCENT2, activeforeground=BG,
             relief="flat", cursor="hand2", pady=9,
             command=self._start)
         self.run_btn.pack(side="left", fill="x", expand=True)
         self.cancel_btn = tk.Button(
-            btn_row, text="✕  Cancel",
+            btn_row, text="\u2715  Cancel",
             font=("Segoe UI", 12, "bold"),
             bg=CARD2, fg=WARN, activebackground=CARD, activeforeground=WARN,
             relief="flat", cursor="hand2", pady=9, padx=14,
@@ -193,7 +295,7 @@ class HoloSubApp(tk.Tk):
         self.cancel_btn.pack(side="left", padx=(6, 0))
 
         self.dl_btn = tk.Button(
-            self, text="⬇  Download video (best quality)",
+            p, text="\u2b07  Download video (best quality)",
             font=("Segoe UI", 10, "bold"),
             bg=CARD2, fg=ACCENT, activebackground=CARD, activeforeground=ACCENT2,
             relief="flat", cursor="hand2", pady=7,
@@ -201,9 +303,9 @@ class HoloSubApp(tk.Tk):
         self.dl_btn.pack(fill="x", padx=20, pady=(6, 0))
 
         # Log
-        self._section("Log")
+        self._section("Log", p)
         self.log_box = scrolledtext.ScrolledText(
-            self, font=FONT_MONO, bg="#08080f", fg=TEXT,
+            p, font=FONT_MONO, bg=LOG_BG, fg=TEXT,
             insertbackground=TEXT, relief="flat", bd=0,
             state="disabled", height=12,
             cursor="arrow")
@@ -215,14 +317,16 @@ class HoloSubApp(tk.Tk):
         self._log(f"Ready. Paste a URL or pick a file, enter your Gemini API key, and go.\n"
                   f"Default model: {GEMINI_MODEL}  |  Encoder: {ffmpeg_utils._ENCODER}\n")
 
-    def _section(self, text):
-        tk.Label(self, text=text, font=FONT_S, bg=BG, fg=SUBTEXT
+    # ── shared helpers ───────────────────────────────────────────────────────
+
+    def _section(self, text, parent=None):
+        tk.Label(parent or self, text=text, font=FONT_S, bg=BG, fg=SUBTEXT
                  ).pack(anchor="w", padx=22, pady=(6, 2))
 
     def _cancel(self):
         self._stop_event.set()
-        self.cancel_btn.configure(state="disabled", text="⏳  Cancelling…")
-        self._log("🛑  Cancel requested — stopping after current chunk…")
+        self.cancel_btn.configure(state="disabled", text="\u23f3  Cancelling\u2026")
+        self._log("\U0001f6d1  Cancel requested \u2014 stopping after current chunk\u2026")
 
     def _browse_file(self):
         p = filedialog.askopenfilename(
@@ -236,6 +340,24 @@ class HoloSubApp(tk.Tk):
         d = filedialog.askdirectory(title="Select output folder")
         if d:
             self.outdir_var.set(d)
+
+    def _on_mode_change(self, *_args):
+        mode = self.mode_var.get()
+        if mode == "local_only":
+            self._model_cb.configure(state="disabled")
+            self._api_status.config(
+                text="Not needed for fully local mode.", fg=SUBTEXT)
+        else:
+            self._model_cb.configure(state="readonly")
+            if not self.apikey_var.get().strip():
+                self._api_status.config(
+                    text="Get a free key at aistudio.google.com \u2014 never stored outside this session.",
+                    fg=SUBTEXT)
+        # VAD toggle only relevant for Whisper modes
+        if mode in ("local", "local_only"):
+            self._vad_card.pack(fill="x", pady=(0, 6))
+        else:
+            self._vad_card.pack_forget()
 
     def _log(self, msg):
         self.log_box.configure(state="normal")
@@ -259,11 +381,12 @@ class HoloSubApp(tk.Tk):
         source  = self.source_var.get().strip()
         api_key = self.apikey_var.get().strip()
         outdir  = self.outdir_var.get().strip()
+        mode    = self.mode_var.get()
 
         if not source:
             messagebox.showwarning("No source", "Please enter a URL or choose a file.")
             return
-        if not api_key:
+        if mode != "local_only" and not api_key:
             messagebox.showwarning("No API key", "Please enter your Gemini API key.")
             return
         if not os.path.isdir(outdir):
@@ -283,13 +406,13 @@ class HoloSubApp(tk.Tk):
                                  "Install:\n  pip install static-ffmpeg\nThen restart holoSub.")
             return
 
-        is_url    = source.startswith("http://") or source.startswith("https://")
-        task      = self.task_var.get()
-        mode      = self.mode_var.get()
-        skip_mins = self.skip_min_var.get() + self.skip_sec_var.get() / 60.0
-        model     = self._model_map.get(self._model_cb.get(), GEMINI_MODEL)
+        is_url     = source.startswith("http://") or source.startswith("https://")
+        task       = self.task_var.get()
+        skip_mins  = self.skip_min_var.get() + self.skip_sec_var.get() / 60.0
+        model      = self._model_map.get(self._model_cb.get(), GEMINI_MODEL)
+        vad_filter = self.vad_var.get()
 
-        if mode == "local":
+        if mode in ("local", "local_only"):
             try:
                 import faster_whisper
             except ImportError:
@@ -298,29 +421,22 @@ class HoloSubApp(tk.Tk):
                                      "Run:\n  pip install faster-whisper\nThen restart holoSub.")
                 return
 
-        self._stop_event.clear()
-        self.run_btn.configure(state="disabled", text="⏳  Validating key…")
-        self.cancel_btn.configure(state="disabled")
-        self._log("🔑  Validating Gemini API key…")
-
-        def validate_and_run():
-            ok, err_msg = validate_api_key(api_key, model)
+        if mode == "local_only" and task == "translate":
+            ok, err_msg = check_ollama()
             if not ok:
-                short_msg = err_msg.split("\n")[0]
-                self.after(0, self._log, f"❌  {err_msg}")
-                self.after(0, self._api_status.config, {"text": f"⚠  {short_msg}", "fg": WARN})
-                self.after(0, self.run_btn.configure,
-                           {"state": "normal", "text": "✦  Generate subtitles"})
+                messagebox.showerror("Ollama not ready", err_msg)
                 return
 
-            self.after(0, self._api_status.config, {"text": "✅  API key valid", "fg": SUCCESS})
-            self.after(0, self._log, "✅  API key valid")
-            self.after(0, self.run_btn.configure, {"text": "⏳  Working…"})
-            self.after(0, self.cancel_btn.configure, {"state": "normal", "text": "✕  Cancel"})
-            self.after(0, self.progress_var.set, 0)
-            self.after(0, self.prog_label.config, {"text": ""})
-            self.after(0, self._log,
-                       f"▶ Source={'URL' if is_url else 'file'}  task={task}  mode={mode}  skip={skip_mins:.1f}min  model={model}")
+        self._stop_event.clear()
+        self.cancel_btn.configure(state="disabled")
+
+        if mode == "local_only":
+            # Skip Gemini validation — go straight to processing
+            self.run_btn.configure(state="disabled", text="\u23f3  Working\u2026")
+            self.cancel_btn.configure(state="normal", text="\u2715  Cancel")
+            self.progress_var.set(0)
+            self.prog_label.config(text="")
+            self._log(f"\u25b6 Source={'URL' if is_url else 'file'}  task={task}  mode={mode}  skip={skip_mins:.1f}min  vad={vad_filter}")
 
             threading.Thread(
                 target=run_pipeline,
@@ -328,7 +444,40 @@ class HoloSubApp(tk.Tk):
                       lambda m: self.after(0, self._log, m),
                       lambda d, t: self.after(0, self._set_progress, d, t),
                       self._on_done,
-                      self._stop_event),
+                      self._stop_event, vad_filter),
+                daemon=True
+            ).start()
+            return
+
+        self.run_btn.configure(state="disabled", text="\u23f3  Validating key\u2026")
+        self._log("\U0001f511  Validating Gemini API key\u2026")
+
+        def validate_and_run():
+            ok, err_msg = validate_api_key(api_key, model)
+            if not ok:
+                short_msg = err_msg.split("\n")[0]
+                self.after(0, self._log, f"\u274c  {err_msg}")
+                self.after(0, self._api_status.config, {"text": f"\u26a0  {short_msg}", "fg": WARN})
+                self.after(0, self.run_btn.configure,
+                           {"state": "normal", "text": "\u2726  Generate subtitles"})
+                return
+
+            self.after(0, self._api_status.config, {"text": "\u2705  API key valid", "fg": SUCCESS})
+            self.after(0, self._log, "\u2705  API key valid")
+            self.after(0, self.run_btn.configure, {"text": "\u23f3  Working\u2026"})
+            self.after(0, self.cancel_btn.configure, {"state": "normal", "text": "\u2715  Cancel"})
+            self.after(0, self.progress_var.set, 0)
+            self.after(0, self.prog_label.config, {"text": ""})
+            self.after(0, self._log,
+                       f"\u25b6 Source={'URL' if is_url else 'file'}  task={task}  mode={mode}  skip={skip_mins:.1f}min  model={model}")
+
+            threading.Thread(
+                target=run_pipeline,
+                args=(source, is_url, task, api_key, outdir, skip_mins, model, mode,
+                      lambda m: self.after(0, self._log, m),
+                      lambda d, t: self.after(0, self._set_progress, d, t),
+                      self._on_done,
+                      self._stop_event, vad_filter),
                 daemon=True
             ).start()
 
@@ -348,8 +497,8 @@ class HoloSubApp(tk.Tk):
             messagebox.showwarning("Bad output folder", f"Folder not found:\n{outdir}")
             return
 
-        self.dl_btn.configure(state="disabled", text="⏳  Downloading…")
-        self._log("⬇  Starting download (best quality)…")
+        self.dl_btn.configure(state="disabled", text="\u23f3  Downloading\u2026")
+        self._log("\u2b07  Starting download (best quality)\u2026")
 
         def do_dl():
             try:
@@ -377,16 +526,16 @@ class HoloSubApp(tk.Tk):
                     ydl.download([source])
                 self.after(0, self._on_download_done, video_dir, True)
             except Exception as e:
-                self.after(0, self._log, f"❌  Download error: {e}")
+                self.after(0, self._log, f"\u274c  Download error: {e}")
                 self.after(0, self._on_download_done, None, False)
 
         threading.Thread(target=do_dl, daemon=True).start()
 
     def _on_download_done(self, out_path, success):
-        self.dl_btn.configure(state="normal", text="⬇  Download video (best quality)")
+        self.dl_btn.configure(state="normal", text="\u2b07  Download video (best quality)")
         if success:
-            self._log(f"✅  Video saved to:\n   {out_path}")
-            messagebox.showinfo("Download complete ✨", f"Video saved to:\n\n{out_path}")
+            self._log(f"\u2705  Video saved to:\n   {out_path}")
+            messagebox.showinfo("Download complete \u2728", f"Video saved to:\n\n{out_path}")
         else:
             messagebox.showerror("Download failed", "Check the log for details.")
 
@@ -394,16 +543,16 @@ class HoloSubApp(tk.Tk):
         self.after(0, self._finish, out_file)
 
     def _finish(self, out_file):
-        self.run_btn.configure(state="normal", text="✦  Generate subtitles")
-        self.cancel_btn.configure(state="disabled", text="✕  Cancel")
+        self.run_btn.configure(state="normal", text="\u2726  Generate subtitles")
+        self.cancel_btn.configure(state="disabled", text="\u2715  Cancel")
         if self._stop_event.is_set() and not out_file:
             self.prog_label.config(text="Cancelled.", fg=WARN)
             return
         if out_file:
             self.progress_var.set(100)
             self.prog_label.config(text="Complete!", fg=SUCCESS)
-            messagebox.showinfo("Done ✨",
+            messagebox.showinfo("Done \u2728",
                                 f"Subtitle file saved:\n\n{out_file}\n\n"
-                                "Load in VLC: Subtitle → Add Subtitle File")
+                                "Load in VLC: Subtitle \u2192 Add Subtitle File")
         else:
-            self.prog_label.config(text="Failed — see log above.", fg=WARN)
+            self.prog_label.config(text="Failed \u2014 see log above.", fg=WARN)

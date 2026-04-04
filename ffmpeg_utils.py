@@ -152,7 +152,7 @@ def reencode_chunk(chunk_path, log):
            "-b:v", str(bitrate_bps),
            "-maxrate", str(bitrate_bps),
            "-bufsize", str(bitrate_bps * 2),
-           "-c:a", "aac", "-b:a", "32k", "-ac", "1", "-ar", REENCODE_ABR,
+           "-c:a", "aac", "-b:a", "32k", "-ac", "1", "-ar", str(REENCODE_ABR),
            out]
     try:
         subprocess.run(cmd, check=True, capture_output=True, timeout=300)

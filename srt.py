@@ -6,7 +6,7 @@ def ms_to_srt(ms):
 
 
 def parse_timestamp(ts):
-    """Parse MM:SS.mmm / MM:SS:mmm / HH:MM:SS into milliseconds."""
+    """Parse MM:SS.mmm / MM:SS:mmm / HH:MM:SS.mmm / HH:MM:SS into milliseconds."""
     try:
         ms_part = 0
         if "." in ts:

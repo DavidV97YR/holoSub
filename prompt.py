@@ -70,19 +70,19 @@ def _build_gemini_schema():
         from google.genai import types as _t
         _sub = _t.Schema(
             type=_t.Type.OBJECT,
-            required=["s", "e", "text"],
+            required=["i", "o", "text"],
             properties={
-                "s":    _t.Schema(type=_t.Type.STRING),
-                "e":    _t.Schema(type=_t.Type.STRING),
+                "i": _t.Schema(type=_t.Type.STRING),
+                "o": _t.Schema(type=_t.Type.STRING),
                 "text": _t.Schema(type=_t.Type.STRING),
             },
         )
         return _t.Schema(
             type=_t.Type.OBJECT,
-            required=["global_analysis", "subs"],
+            required=["preflight", "cues"],
             properties={
-                "global_analysis": _t.Schema(type=_t.Type.STRING),
-                "subs": _t.Schema(type=_t.Type.ARRAY, items=_sub),
+                "preflight": _t.Schema(type=_t.Type.STRING),
+                "cues": _t.Schema(type=_t.Type.ARRAY, items=_sub),
             },
         )
     except ImportError:
@@ -97,8 +97,8 @@ def make_instruction(task, title):
         lang_rule = (
             "The streamers speak Japanese. Transcribe every utterance and translate "
             "into natural, colloquial English. Keep VTuber energy — translate 'yabe', "
-            "'sugoi', 'kawaii' idiomatically, not literally. Never translate in isolation — "
-            "use context from surrounding lines to determine pronouns, tense, and tone."
+            "'sugoi', 'kawaii' idiomatically, not literally. Use surrounding lines "
+            "for pronouns, tense, and tone — never translate in isolation."
         )
         text_field = "English translation only"
     else:
@@ -108,7 +108,7 @@ def make_instruction(task, title):
         )
         text_field = "Japanese transcription only"
 
-    return f"""You are an advanced AI expert in audio-visual subtitling. Your specialty is generating audio-synchronised, contextually rich subtitles from multimodal video+audio input using native audio tokenization.
+    return f"""You are a specialist subtitle generator for hololive VTuber streams. You produce tightly-synchronised subtitles from raw video+audio using native audio tokenization.
 
 {ctx}
 
@@ -117,16 +117,16 @@ def make_instruction(task, title):
 
 {_HOLOLIVE_NAMES}
 
-### THE GOLDEN RULE: AUDIO DICTATES "WHEN", VIDEO DICTATES "WHAT"
+### THE GOLDEN RULE: VOICE-LOCKED TIMING, CONTEXT-INFORMED CONTENT
 Strictly separate the task of *timing* from the task of *transcription*.
 
-**WHEN (Timing):** The streamer's voice is your absolute ground truth for timestamps. The exact moment a vocal starts dictates `s`. NEVER output a subtitle if no streamer voice is present.
+**WHEN (Timing):** The voice waveform is absolute ground truth. `i` = first syllable onset. `o` = last syllable offset. No voice = no cue.
 
-**WHAT (Content):** Use the video visuals, on-screen text, and stream title to determine correct spelling, names, and context. When audio is ambiguous:
-1. On-screen text (burnt-in subtitles, overlays) — absolute override.
-2. The talent name reference list above — use exact spellings.
-3. Visual scene context — what is actively happening on screen.
-4. Stream title for broader context.
+**WHAT (Content):** Resolve what was said using this priority order:
+1. Burnt-in on-screen text / hardcoded subtitles — overrides everything.
+2. The hololive name list above — always use exact romanisation.
+3. Visual context — actions, expressions, environment.
+4. Stream title — broader topical context.
 
 **Silence rules — ONLY stay silent when:**
 - Pure instrumental BGM or ambience with no voice whatsoever.
@@ -145,81 +145,92 @@ Strictly separate the task of *timing* from the task of *transcription*.
 ### PRIORITY 1: PRECISION TIMESTAMPS
 Treat every subtitle as a discrete, isolated event tied exclusively to the streamer's voice.
 
-- **Timecode format:** Strictly `MM:SS.mmm` (e.g., `01:05.300`). Always pad with zeros.
-- **`s`** = the exact moment the first word begins. **`e`** = the exact moment the last word ends.
-- **No stretching for readability:** `e` MUST match when the last word ends, not when a human would want the text to disappear. Never stretch `e` to keep text on screen longer.
-- **Prevent the "Traffic Jam" effect:** If you stretch `e` too long, it bleeds into the next subtitle's `s`, pushing everything out of sync. Each subtitle's `s` and `e` must tightly wrap only its own phrase — not bleed into the next one.
-- **Unique start times:** Every entry MUST have a unique `s` — no two entries may share the same start time.
-- **Strictly sequential:** `s` of entry N+1 MUST always be greater than `e` of entry N.
+- **Format:** Strictly `MM:SS.mmm` (e.g., `02:14.070`). Always pad with zeros.
+- **`i`** = the exact moment the first word begins. **`o`** = the exact moment the last word ends.
+- **No stretching for readability:** `o` MUST match when the last word ends, not when a human would want the text to disappear. Never stretch `o` to keep text on screen longer. If you stretch `o` too long, it bleeds into the next entry's `i`, pushing everything out of sync. Each entry's `i` and `o` must tightly wrap only its own phrase.
+- **Unique starts:** No two entries share the same `i`.
+- **Strict ordering:** Entry N+1's `i` > entry N's `o`.
 
 ### PRIORITY 2: SEGMENTATION
 - **Pause = split:** If there is a physical pause or breath in the middle of a sentence, SPLIT into a new block. NEVER merge speech across a pause into one entry.
-- **Continuous breath split:** If splitting a continuous uninterrupted sentence only to stay under 50 characters, Part 1 `e` MUST EXACTLY EQUAL Part 2 `s` — do not invent a gap that doesn't exist in the audio.
-- **Max ~50 characters per line.**
+- **Length-only splits:** If splitting a continuous uninterrupted sentence only to stay under 50 characters, block 1's `o` MUST EXACTLY EQUAL block 2's `i` — do not invent a gap that doesn't exist in the audio.
+- **Max ~50 characters per entry.**
+- **Keep short reactions as their own entries:** Exclamations like "yabai!", "eh?", "uso!" should be individual entries — do not merge them into adjacent speech.
 - **No repeated text:** Never output the same text in consecutive entries.
+
+### KNOWN FAILURE MODES — AVOID THESE
+
+**"Hallucinated Speech":**
+Never invent cues for audio gaps. If there is a 5-second silence between utterances, there must be a 5-second gap in your output. However, rapid back-to-back entries ARE correct when the speaker is actually talking fast — VTubers frequently produce many short utterances in quick succession. Match the real pace of speech.
+
+**"Early Cutoff" (incomplete coverage):**
+Subtitle the ENTIRE clip from start to finish. Do not stop generating cues partway through. If the speaker is still talking at the end of the video, your last cue should cover that final utterance.
 
 ### EXAMPLES
 
-**Example 1: Two streamers in rapid back-and-forth during gameplay**
-*Scenario:* Su says "やばい！" (00:02.100–00:02.500), Chihaya immediately says "大丈夫！" (00:02.500–00:03.100).
+**Rapid back-and-forth during gameplay:**
+Su says "やばい！" (00:02.100–00:02.500), Chihaya immediately says "大丈夫！" (00:02.500–00:03.100).
 ```json
 {{
-  "global_analysis": "Two streamers reacting during racing gameplay. Both are speaking continuously with no silent gaps. Timestamps tightly wrap each utterance.",
-  "subs": [
-    {{"s": "00:02.100", "e": "00:02.500", "text": "Oh no!"}},
-    {{"s": "00:02.500", "e": "00:03.100", "text": "You're okay!"}}
+  "preflight": "SCENE: Two streamers reacting during racing gameplay. SILENCE CHECK: Both speaking — no incorrect silencing. TIMING CHECK: Each cue tightly wraps its utterance, no padding.",
+  "cues": [
+    {{"i": "00:02.100", "o": "00:02.500", "text": "Oh no!"}},
+    {{"i": "00:02.500", "o": "00:03.100", "text": "You're okay!"}}
   ]
 }}
 ```
 
-**Example 2: Streamer talking over a sponsor segment**
-*Scenario:* An ad for NEXTGEAR is on screen. The streamer is narrating over it from 00:05.000.
+**Simultaneous speakers in a collab:**
+Riona says "やったー！" (00:15.200–00:15.600) while Chihaya says "すごい！" starting at (00:15.300–00:15.800). Both are audible.
 ```json
 {{
-  "global_analysis": "Sponsor segment visible on screen. Streamer is actively speaking over it — subtitling their speech as normal.",
-  "subs": [
-    {{"s": "00:05.000", "e": "00:07.200", "text": "So this is the new NEXTGEAR case!"}},
-    {{"s": "00:07.400", "e": "00:09.100", "text": "It has a glass panel on two sides."}}
+  "preflight": "SCENE: Two streamers celebrating at the same time. SILENCE CHECK: Both voices audible — subtitling both. TIMING CHECK: Entries are short and tightly wrapped to each voice.",
+  "cues": [
+    {{"i": "00:15.200", "o": "00:15.600", "text": "We did it!"}},
+    {{"i": "00:15.300", "o": "00:15.800", "text": "Amazing!"}}
   ]
 }}
 ```
 
-**Example 3: Splitting a continuous breath vs a paused sentence**
-*Scenario:* Streamer says one continuous breath "それはちょっと違うんじゃないかな" (00:10.000–00:11.800, no pause). Too long, must split at 50 chars.
+**Length-only split (continuous breath, no pause):**
+Streamer says "それはちょっと違うんじゃないかな" (00:10.000–00:11.800) in one breath. Over 50 chars, must split.
 ```json
 {{
-  "global_analysis": "Single continuous utterance split for length only — no audio pause exists, so Part 1 e equals Part 2 s exactly.",
-  "subs": [
-    {{"s": "00:10.000", "e": "00:10.900", "text": "That's a little..."}},
-    {{"s": "00:10.900", "e": "00:11.800", "text": "...different, don't you think?"}}
+  "preflight": "SCENE: Single streamer, casual conversation. SILENCE CHECK: N/A — continuous speech. TIMING CHECK: No audio gap exists so block 1 `o` equals block 2 `i`.",
+  "cues": [
+    {{"i": "00:10.000", "o": "00:10.900", "text": "That's a little..."}},
+    {{"i": "00:10.900", "o": "00:11.800", "text": "...different, don't you think?"}}
   ]
 }}
 ```
 
-**Example 4: Opening theme song / intro sequence**
-*Scenario:* The stream begins with an animated intro playing the streamer's theme song with vocals. Subtitle the singing. The live stream conversation begins at 03:06.
+**Intro theme song then live conversation:**
+Animated intro with vocal theme. Live stream starts at 03:06.
 ```json
 {{
-  "global_analysis": "Clip begins with an animated intro sequence containing the streamer's theme song with vocals. Subtitling the singing as normal. Live stream conversation begins at approximately 03:06.",
-  "subs": [
-    {{"s": "00:02.100", "e": "00:04.500", "text": "Riona-chan!"}},
-    {{"s": "00:04.700", "e": "00:07.200", "text": "Yes! Sakisaki Riona!"}},
-    {{"s": "03:06.500", "e": "03:08.200", "text": "Okay, let's get started!"}}
+  "preflight": "SCENE: Animated intro with theme song vocals, then live conversation. SILENCE CHECK: Subtitled intro vocals — not silenced. TIMING CHECK: Gap between 00:07.200 and 03:06.500 is real silence.",
+  "cues": [
+    {{"i": "00:02.100", "o": "00:04.500", "text": "Riona-chan!"}},
+    {{"i": "00:04.700", "o": "00:07.200", "text": "Yes! Sakisaki Riona!"}},
+    {{"i": "03:06.500", "o": "03:08.200", "text": "Okay, let's get started!"}}
   ]
 }}
 ```
 
 ### OUTPUT FORMAT
-Return ONLY a valid JSON object. No markdown. Output `global_analysis` FIRST.
+Return ONLY valid JSON. No markdown. Output `preflight` FIRST.
 
-`global_analysis` is a strict verification step — state: (1) what is in this clip and who is speaking, (2) confirm no gameplay/ad sections were silenced incorrectly, (3) confirm no Traffic Jam stretching was applied.
+`preflight` is a structured verification checklist with three mandatory checks:
+- **SCENE:** Who is speaking and what is happening.
+- **SILENCE CHECK:** Confirm you did not incorrectly silence any gameplay/ad/cutscene/intro sections.
+- **TIMING CHECK:** Confirm every `o` stops at the last syllable with no padding, and no cascade drift.
 
 {{
-  "global_analysis": "...",
-  "subs": [
+  "preflight": "SCENE: ... SILENCE CHECK: ... TIMING CHECK: ...",
+  "cues": [
     {{
-      "s": "MM:SS.mmm",
-      "e": "MM:SS.mmm",
+      "i": "MM:SS.mmm",
+      "o": "MM:SS.mmm",
       "text": "{text_field}"
     }}
   ]
@@ -275,7 +286,7 @@ def parse_response(raw_text, offset_ms, label, log):
             log(f"⚠️  {label}: unparseable JSON — will retry")
             return None, False
 
-    analysis = obj.get("global_analysis", "")
+    analysis = obj.get("preflight", "")
     if analysis:
         if len(analysis) > 150:
             truncated_analysis = analysis[:150].rsplit(' ', 1)[0] + "…"
@@ -284,17 +295,17 @@ def parse_response(raw_text, offset_ms, label, log):
         log(f"💬  {label}: {truncated_analysis}")
 
     if truncated:
-        log(f"⚠️  {label}: response was truncated, salvaged {len(obj.get('subs', []))} entries — will retry")
+        log(f"⚠️  {label}: response was truncated, salvaged {len(obj.get('cues', []))} entries — will retry")
 
     entries = []
-    for s in obj.get("subs", []):
-        text = str(s.get("text", "")).strip()
+    for cue in obj.get("cues", []):
+        text = str(cue.get("text", "")).strip()
         if not text:
             continue
         # Strip embedded newlines Gemini sometimes sneaks in despite instructions
         text = text.replace("\n", " ").strip()
-        start_ms = parse_timestamp(s.get("s", "00:00.000")) + offset_ms
-        end_ms   = parse_timestamp(s.get("e", "00:00.000")) + offset_ms
+        start_ms = parse_timestamp(cue.get("i", "00:00.000")) + offset_ms
+        end_ms   = parse_timestamp(cue.get("o", "00:00.000")) + offset_ms
         if end_ms <= start_ms:
             end_ms = start_ms + 2000
         entries.append({"start_ms": start_ms, "end_ms": end_ms, "text": text})
